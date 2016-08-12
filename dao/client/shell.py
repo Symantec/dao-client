@@ -25,13 +25,13 @@ from dao.common import config
 config.setup('client')
 
 # Must be imported after config is initialized.
+import requests
 from dao.common import log
-from dao.common import rpc
 from dao.common import exceptions
 
 
 opts = [
-    config.StrOpt('client', 'master_url', default='tcp://localhost:5555',
+    config.StrOpt('client', 'master_url', default='http://localhost:5000/v1.0',
                   help='Full URL for DAO Master agent.'),
     config.StrOpt('client', 'location_var', default='DAO_LOCATION',
                   help='Name of the OS variable to use as location'),
@@ -88,18 +88,22 @@ class DAOClient(object):
     def __init__(self, print_format, user, location, parser):
         self.print_format = print_format
         self.parser = parser
-        self.manager = rpc.RPCApi(CONF.client.master_url)
         self.user = user
         # Canonic name format for location is all-caps.
         self.location = location.upper()
 
     def _call(self, func, *args, **kwargs):
-        result = self.manager.call(func, self.user, self.location,
-                                   *args, **kwargs)
-        if isinstance(result, Exception):
-            print result
-            sys.exit(1)
-        return result
+        data = dict(func=func,
+                    args=(self.user, self.location) + args,
+                    kwargs=kwargs)
+        r = requests.post(requests.compat.urljoin(CONF.client.master_url,
+                                                  'tasks'),
+                          data=json.dumps(data),
+                          headers={'Content-Type': 'application/json'})
+        if 200 <= r.status_code < 300:
+            return r.json()['result']
+        print r.text
+        sys.exit(1)
 
     @cli_command
     def get_master_config(self, args):
@@ -147,7 +151,7 @@ class DAOClient(object):
     @cli_argument('--json', action='store_true', default=False,
                   help='Parameter is a json field')
     def object_update(self, args):
-        """Update any CMS object."""
+        """Update any DB object."""
         args_dict = dict(item.split('=') for item in args.set)
         key, key_value = args.key.split('=')
         if args.json:
@@ -234,7 +238,7 @@ class DAOClient(object):
     @cli_argument('--reset-worker', action='store_true', default=False,
                   help='Optional argument. Reset worker control over the rack')
     def rack_update(self, args):
-        """Update rack record in the CMS"""
+        """Update rack record in the DB"""
         gateway = str(netaddr.IPAddress(args.gw)) if args.gw else None
         self._print_result(
             args, self._call('rack_update',
@@ -518,15 +522,15 @@ class DAOClient(object):
 
     @cli_command
     @cli_argument('--type', required=True,
-                  help='CMS object type. Sku, Worker, Rack, Subnet, Asset, '
-                       'NetworkInterface, Cluster, NetworkDevice, Server')
+                  help='DB object type. Sku, Worker, Rack, Subnet, Asset, '
+                       'SwitchInterface, Cluster, NetworkDevice, Server')
     @cli_argument('--key', help='Identifier in a format of key_name=key_value.'
                                 ' Key should represent some unique field.')
     @cli_usage(['Examples:'
                 ' dao history --type Server',
                 ' dao history --type Rack --key name=PHX2-A1'])
     def history(self, args):
-        """List history of updates to CMS that was done using DAO.
+        """List history of updates to DB that was done using DAO.
         """
         key_name, key_value = args.key.split('=') if args.key else (None, None)
         result = self._call('history', args.type,
@@ -676,20 +680,28 @@ def check_user():
     return user
 
 
-def run():
-    """Entry point for CLI. Parse arguments, locate function and call it"""
-    user = check_user()
-    parser = argparse.ArgumentParser()
+class DAOParser(argparse.ArgumentParser):
+    def get_subparsers(self, name):
+        result = [action for action in self._actions if action.dest == name]
+        if result:
+            return result[0]
+        else:
+            raise RuntimeError('Unable to locate subparser')
+
+
+def get_parser():
+    parser = DAOParser()
     parser.add_argument('--format', default='print',
                         help='Output format. json|cvs|print')
     parser.add_argument('--filter', default='',
-                        help='--filter serial,protected')
+                        help='Filter the result fields. Coma separated.'
+                             'An example: asset.serial,pxe_ip')
     parser.add_argument('--debug', default=False, action='store_true',
-                        help='Print error if happen')
+                        help='Provide an extended error output')
     parser.add_argument('--location', default=None,
-                        help='Location. Can use parameter or {0}'.
+                        help='Location. Can be set in client.cfg'.
                         format(CONF.client.location_var))
-    subparsers = parser.add_subparsers(dest='func', help='sub-command help')
+    subparsers = parser.add_subparsers(dest='command', help='sub-command help')
     for name, func in HANDLERS.items():
         sub_parser = subparsers.add_parser(name, help=func.func_doc)
         for args, kwargs in getattr(func, 'cli_args', []):
@@ -699,17 +711,25 @@ def run():
             if isinstance(usage, list):
                 usage = '\n\r'.join(usage)
             sub_parser.description = usage
+    return parser
+
+
+def run():
+    """Entry point for CLI. Parse arguments, locate function and call it"""
+    user = check_user()
+    parser = get_parser()
     args = parser.parse_args()
-    # Ensure environnment is set
+    # Ensure environment is set
     dao_location = args.location or os.getenv(CONF.client.location_var)
     dao_location = dao_location or CONF.client.location
     if not dao_location:
         parser.error('Either --location or {0} should be specified'.
                      format(CONF.client.location_var))
-    sub_parser = subparsers.choices[args.func]
+    argparse.ArgumentTypeError('Value has to be between 0 and 1' )
+    sub_parser = parser.get_subparsers('command').choices[args.command]
     cli = DAOClient(args.format, user, dao_location, sub_parser)
     try:
-        HANDLERS[args.func](cli, args)
+        HANDLERS[args.command](cli, args)
     except exceptions.DAOTimeout:
         msg = 'DAO Master at {ip} could not be reached: timeout'.format(
             ip=CONF.client.master_url)
